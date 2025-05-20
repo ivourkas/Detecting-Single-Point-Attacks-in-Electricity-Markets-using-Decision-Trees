@@ -1,111 +1,171 @@
-
 def engineer_advanced_features(df):
     """
-    Apply advanced feature engineering techniques to improve attack detection,
-    with special focus on Lower Limit Attacks and vulnerable generators
+    Apply advanced feature engineering techniques to improve attack detection
+    
     """
     print("\n=== Performing advanced feature engineering ===")
     import numpy as np
+    import pandas as pd
     
     # Store original shape for reporting
     original_shape = df.shape
     
-    # ====================== 1. ENHANCED LOWER LIMIT ATTACK DETECTION FEATURES ======================
-    print("\n1. Creating specialized Lower Limit Attack detection features...")
+    # ====================== DOMAIN-SPECIFIC FEATURE ENGINEERING ======================
+    print("\n=== Performing domain-specific feature engineering ===")
+
+    # 1. Basic session and time features
+    df['day_in_ssn'] = df.groupby('ssn').cumcount() + 1  # Start at Day 1
+
+    # 2. Calculate OPF sensitivity features
+    # These help identify attacks on specific OPF parameters
+
+    # 2.1 Cost function sensitivity indicators
+    # Create features that might detect manipulation of generation costs (Type 4 attack)
+    df['fval_per_unit_load'] = df['fval'] / df.groupby('ssn')['fval'].transform('mean')
+    df['fval_normalized_by_ssn'] = df.groupby('ssn')['fval'].transform(
+        lambda x: (x - x.mean()) / (x.std() if x.std() != 0 else 1))
+
+    # 2.2 Ramp rate indicators 
+    # Create features that might detect manipulation of ramp rates (Type 1 attack)
+    df['fval_change'] = df.groupby('ssn')['fval'].diff().fillna(0)
+    df['fval_change_rate'] = df['fval_change'] / df['fval'].shift(1).fillna(1)
+    df['fval_acceleration'] = df.groupby('ssn')['fval_change'].diff().fillna(0)
+
+    # Create rolling metrics to detect unusual ramp behavior
+    for window in [2, 3, 5]:
+        # Rolling standard deviation of changes (volatility)
+        df[f'fval_change_std_{window}d'] = df.groupby('ssn')['fval_change'].transform(
+            lambda x: x.rolling(window=window, min_periods=1).std().fillna(0))
+        
+        # Maximum change in the window
+        df[f'fval_max_change_{window}d'] = df.groupby('ssn')['fval_change'].transform(
+            lambda x: x.rolling(window=window, min_periods=1).max().fillna(0))
+        
+        # Minimum change in the window
+        df[f'fval_min_change_{window}d'] = df.groupby('ssn')['fval_change'].transform(
+            lambda x: x.rolling(window=window, min_periods=1).min().fillna(0))
+
+    # 2.3 Generation limit indicators
+    # Create features that might detect manipulation of upper/lower limits (Type 2 & 3 attacks)
+    df['fval_peak_ratio'] = df['fval'] / df.groupby('ssn')['fval'].transform('max')
+    df['fval_trough_ratio'] = df['fval'] / df.groupby('ssn')['fval'].transform('min')
+
+    # Use quantiles to detect limits being approached
+    df['fval_quantile_in_ssn'] = df.groupby('ssn')['fval'].transform(
+        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop').astype(float))
+
+    # 3. Create specialized detection features for each attack type
+    # These target the specific mechanisms of each attack type
+
+    # 3.1 Features for detecting sudden value changes
+    # Look for discontinuities in how fast values can change
+    df['change_threshold_exceeded'] = (df['fval_change'].abs() > 
+                                      df.groupby('ssn')['fval_change'].transform('std')).astype(int)
+
+    # 3.2 Features for detecting boundary approaches
+    # Look for values that approach the extremes of observed ranges
+    df['max_boundary_proximity'] = 1 - (df['fval'] / df.groupby('ssn')['fval'].transform('max'))
+    df['min_boundary_proximity'] = (df['fval'] / df.groupby('ssn')['fval'].transform('min')) - 1
+
+    # 3.3 Features for detecting cost manipulation (Type 4)
+    # Look for cost-inefficient dispatches that shouldn't happen under normal cost functions
+    df['cost_efficiency'] = df['fval'] / df.groupby('ssn')['fval'].transform('mean')
+    df['cost_anomaly_score'] = df.groupby('ssn')['cost_efficiency'].transform(
+        lambda x: (x - x.mean()).abs() / (x.std() if x.std() != 0 else 1))
+
+    # 4. Inter-session comparison features
+    # These help identify if a session is behaving differently from others
+
+    # 4.1 Calculate average fval across all sessions for each day
+    day_avg = df.groupby('day_in_ssn')['fval'].transform('mean')
+    day_std = df.groupby('day_in_ssn')['fval'].transform('std')
+
+    # 4.2 Compare each session's values to the average across all sessions
+    df['fval_day_deviation'] = (df['fval'] - day_avg) / (day_std if day_std.any() != 0 else 1)
+    df['fval_day_pct_diff'] = (df['fval'] - day_avg) / day_avg
+
+    # 5. Statistical anomaly detection features
+    # These help identify outliers regardless of attack mechanism
+
+    # 5.1 Z-scores and modified Z-scores for more robust outlier detection
+    df['fval_median_dev'] = df.groupby('ssn')['fval'].transform(
+        lambda x: (x - x.median()) / (x.max() - x.min() if (x.max() - x.min()) != 0 else 1))
+
+    # 6. Cumulative features to detect subtle long-term manipulations
+    df['fval_cumsum'] = df.groupby('ssn')['fval'].cumsum()
+    df['fval_cummean'] = df.groupby('ssn')['fval'].expanding().mean().reset_index(level=0, drop=True)
+    df['fval_cum_deviation'] = df['fval'] - df['fval_cummean']
+
+    # 7. Trajectory features to detect changes in patterns
+    for lag in range(1, 4):
+        df[f'fval_lag_{lag}'] = df.groupby('ssn')['fval'].shift(lag).fillna(0)
+        df[f'fval_diff_lag_{lag}'] = df['fval'] - df[f'fval_lag_{lag}']
     
-    # 1.1 Improved lower limit proximity features
-    # More granular detection of approaches to lower limits
-    df['lower_limit_proximity_squared'] = df['lower_limit_proximity'] ** 2
-    df['lower_limit_proximity_cubed'] = df['lower_limit_proximity'] ** 3
+    # ====================== 1. ENHANCED MINIMUM BOUNDARY DETECTION FEATURES ======================
+    print("\n1. Creating specialized minimum boundary detection features...")
     
-    # 1.2 Lower limit violation likelihood
-    # Higher values indicate higher likelihood of lower limit violation
-    df['lower_limit_violation_likelihood'] = (
+    # 1.1 Improved minimum boundary proximity features
+    # More granular detection of approaches to minimum boundaries
+    df['min_boundary_proximity_squared'] = df['min_boundary_proximity'] ** 2
+    df['min_boundary_proximity_cubed'] = df['min_boundary_proximity'] ** 3
+    
+    # 1.2 Minimum boundary violation likelihood
+    # Higher values indicate higher likelihood of minimum boundary violation
+    df['min_boundary_violation_likelihood'] = (
         (df['fval'] < df.groupby('ssn')['fval'].transform('min') * 1.05).astype(int)
     )
     
-    # 1.3 Exponentially weighted lower limit proximity
-    # Gives more weight to values closer to the lower limit
-    df['exp_lower_limit_proximity'] = np.exp(df['lower_limit_proximity'] * 10) - 1
+    # 1.3 Exponentially weighted minimum boundary proximity
+    # Gives more weight to values closer to the minimum boundary
+    df['exp_min_boundary_proximity'] = np.exp(df['min_boundary_proximity'] * 10) - 1
     
-    # 1.4 Lower limit proximity change rate
-    # Detects rapid approaches to lower limits
-    df['lower_limit_proximity_change'] = df.groupby('ssn')['lower_limit_proximity'].diff().fillna(0)
-    df['lower_limit_approach_rate'] = (
-        df['lower_limit_proximity_change'] / df['lower_limit_proximity'].shift(1).fillna(0.1)
+    # 1.4 Minimum boundary proximity change rate
+    # Detects rapid approaches to boundaries
+    df['min_boundary_proximity_change'] = df.groupby('ssn')['min_boundary_proximity'].diff().fillna(0)
+    df['min_boundary_approach_rate'] = (
+        df['min_boundary_proximity_change'] / df['min_boundary_proximity'].shift(1).fillna(0.1)
     ).replace([np.inf, -np.inf], 0)
     
-    # 1.5 Lower limit threshold crossings
-    # Counts how many times values get close to the lower limit in a session
+    # 1.5 Minimum boundary threshold crossings
+    # Counts how many times values get close to the minimum boundary in a session
     threshold = 0.05  # 5% above minimum
-    df['near_lower_limit'] = (df['lower_limit_proximity'] < threshold).astype(int)
-    df['lower_limit_crossings'] = df.groupby('ssn')['near_lower_limit'].cumsum()
+    df['near_min_boundary'] = (df['min_boundary_proximity'] < threshold).astype(int)
+    df['min_boundary_crossings'] = df.groupby('ssn')['near_min_boundary'].cumsum()
     
-    # 1.6 Lower limit temporal pattern detection
-    # Detects patterns of gradually approaching limits
+    # 1.6 Minimum boundary temporal pattern detection
+    # Detects patterns of gradually approaching boundaries
     for window in [2, 3, 5]:
-        # Rolling mean of proximity to lower limit
-        df[f'lower_limit_proximity_mean_{window}d'] = df.groupby('ssn')['lower_limit_proximity'].transform(
+        # Rolling mean of proximity to minimum boundary
+        df[f'min_boundary_proximity_mean_{window}d'] = df.groupby('ssn')['min_boundary_proximity'].transform(
             lambda x: x.rolling(window=window, min_periods=1).mean().fillna(0)
         )
         
-        # Trend in proximity to lower limit
-        df[f'lower_limit_proximity_trend_{window}d'] = (
-            df['lower_limit_proximity'] - df[f'lower_limit_proximity_mean_{window}d']
+        # Trend in proximity to minimum boundary
+        df[f'min_boundary_proximity_trend_{window}d'] = (
+            df['min_boundary_proximity'] - df[f'min_boundary_proximity_mean_{window}d']
         )
     
-    # # ====================== 2. VULNERABLE GENERATOR SPECIFIC FEATURES ======================
-    # print("2. Creating vulnerable generator specific features...")
+    # ====================== 3. LARGE CHANGES WITHOUT THRESHOLD FEATURES ======================
+    print("3. Creating features for large changes without threshold activation...")
     
-    # # List of vulnerable generators based on our analysis
-    # vulnerable_generators = [7, 25, 31, 44, 52, 60, 69]
-    
-    # # 2.1 Vulnerable generator indicator
-    # df['is_vulnerable_generator'] = df['gen_attacked'].isin(vulnerable_generators).astype(int)
-    
-    # # 2.2 Generator-specific anomaly scores
-    # # For each vulnerable generator, calculate targeted anomaly scores
-    # for gen in vulnerable_generators:
-    #     # Create a mask for the specific generator
-    #     gen_mask = (df['gen_attacked'] == gen)
-        
-    #     if gen_mask.sum() > 0:  # Only process if this generator exists in the data
-    #         # Generator-specific fval statistics
-    #         gen_fval_mean = df[gen_mask]['fval'].mean()
-    #         gen_fval_std = df[gen_mask]['fval'].std() if df[gen_mask]['fval'].std() > 0 else 1
-            
-    #         # Calculate generator-specific z-scores
-    #         df[f'gen{gen}_fval_zscore'] = 0.0  # Initialize with zeros
-    #         df.loc[gen_mask, f'gen{gen}_fval_zscore'] = (df.loc[gen_mask, 'fval'] - gen_fval_mean) / gen_fval_std
-            
-    #         # Calculate generator-specific change anomaly
-    #         gen_change_mean = df[gen_mask]['fval_change'].mean()
-    #         gen_change_std = df[gen_mask]['fval_change'].std() if df[gen_mask]['fval_change'].std() > 0 else 1
-            
-    #         df[f'gen{gen}_change_zscore'] = 0.0  # Initialize with zeros
-    #         df.loc[gen_mask, f'gen{gen}_change_zscore'] = (df.loc[gen_mask, 'fval_change'] - gen_change_mean) / gen_change_std
-    
-    # ====================== 3. LARGE CHANGES WITHOUT RAMP CONSTRAINT FEATURES ======================
-    print("3. Creating features for large changes without ramp constraint activation...")
-    
-    # 3.1 Large change but no ramp constraint indicator
-    # This targets the pattern we observed in missed attacks
-    df['large_change_no_constraint'] = (
+    # 3.1 Large change but no threshold indicator
+    # This targets patterns where large changes occur without triggering thresholds
+    df['large_change_no_threshold'] = (
         (df['fval_change'].abs() > df.groupby('ssn')['fval_change'].transform('std') * 1.5) & 
-        (df['ramp_constraint_active'] == 0)
+        (df['change_threshold_exceeded'] == 0)
     ).astype(int)
     
-    # 3.2 Large change magnitude without ramp constraint
-    df['large_change_no_constraint_magnitude'] = df['fval_change'].abs() * (1 - df['ramp_constraint_active'])
+    # 3.2 Large change magnitude without threshold
+    df['large_change_no_threshold_magnitude'] = df['fval_change'].abs() * (1 - df['change_threshold_exceeded'])
     
-    # 3.3 Cumulative large changes without constraints
-    df['cum_large_changes_no_constraint'] = df.groupby('ssn')['large_change_no_constraint'].cumsum()
+    # 3.3 Cumulative large changes without thresholds
+    df['cum_large_changes_no_threshold'] = df.groupby('ssn')['large_change_no_threshold'].cumsum()
     
-    # 3.4 Ratio of change to standard deviation without triggering constraint
-    df['change_std_ratio_no_constraint'] = (
+    # 3.4 Ratio of change to standard deviation without triggering threshold
+    df['change_std_ratio_no_threshold'] = (
         df['fval_change'].abs() / 
         (df['fval_change_std_3d'] + 0.1)  # Adding small constant to avoid division by zero
-    ) * (1 - df['ramp_constraint_active'])
+    ) * (1 - df['change_threshold_exceeded'])
     
     # ====================== 4. TEMPORAL PATTERN DETECTION FEATURES ======================
     print("4. Creating temporal pattern detection features...")
@@ -158,43 +218,28 @@ def engineer_advanced_features(df):
         df[f'fval_sin_{period}d_interaction'] = df['fval'] * df[f'fval_sin_{period}d']
         df[f'fval_cos_{period}d_interaction'] = df['fval'] * df[f'fval_cos_{period}d']
     
-    # ====================== 5. COMPOSITE ATTACK-SPECIFIC FEATURES ======================
-    print("5. Creating composite attack-specific features...")
+    # ====================== 5. COMPOSITE ANOMALY DETECTION FEATURES ======================
+    print("5. Creating composite anomaly detection features...")
     
-    # 5.1 Lower Limit Attack composite score
-    df['lower_limit_attack_score'] = (
-        df['lower_limit_proximity'] * 0.3 +
-        df['exp_lower_limit_proximity'] * 0.3 +
-        df['lower_limit_approach_rate'].clip(0, 10) * 0.2 +
-        df['near_lower_limit'] * 0.2
+    # 5.1 Minimum Boundary Approach composite score
+    df['min_boundary_approach_score'] = (
+        df['min_boundary_proximity'] * 0.3 +
+        df['exp_min_boundary_proximity'] * 0.3 +
+        df['min_boundary_approach_rate'].clip(0, 10) * 0.2 +
+        df['near_min_boundary'] * 0.2
     )
     
-    # 5.2 Large Change without Constraint composite score
-    df['large_change_no_constraint_score'] = (
-        df['large_change_no_constraint'] * 0.4 +
-        df['large_change_no_constraint_magnitude'].clip(0, 1000) / 1000 * 0.3 +
-        df['change_std_ratio_no_constraint'].clip(0, 10) / 10 * 0.3
+    # 5.2 Large Change without Threshold composite score
+    df['large_change_no_threshold_score'] = (
+        df['large_change_no_threshold'] * 0.4 +
+        df['large_change_no_threshold_magnitude'].clip(0, 1000) / 1000 * 0.3 +
+        df['change_std_ratio_no_threshold'].clip(0, 10) / 10 * 0.3
     )
     
-    # # 5.3 Vulnerable Generator Attack composite score
-    # # This will be 0 for non-vulnerable generators
-    # df['vulnerable_gen_attack_score'] = 0.0
-    
-    # # Only calculate for the vulnerable generators
-    # for gen in vulnerable_generators:
-    #     gen_mask = (df['gen_attacked'] == gen)
-        
-    #     if gen_mask.sum() > 0 and f'gen{gen}_fval_zscore' in df.columns and f'gen{gen}_change_zscore' in df.columns:
-    #         # Calculate the score only for rows with this generator
-    #         df.loc[gen_mask, 'vulnerable_gen_attack_score'] = (
-    #             df.loc[gen_mask, f'gen{gen}_fval_zscore'].abs().clip(0, 5) / 5 * 0.5 +
-    #             df.loc[gen_mask, f'gen{gen}_change_zscore'].abs().clip(0, 5) / 5 * 0.5
-    #         )
-    
-    # 5.4 Weighted anomaly score combining all attack types
-    df['weighted_attack_score'] = (
-        df['lower_limit_attack_score'] * 0.6 +  # More weight to lower limit attacks (our biggest weakness)
-        df['large_change_no_constraint_score'] * 0.4
+    # 5.4 Weighted anomaly score combining all anomaly types
+    df['weighted_anomaly_score'] = (
+        df['min_boundary_approach_score'] * 0.6 +  # More weight to boundary violations (our biggest weakness)
+        df['large_change_no_threshold_score'] * 0.4
     )
     
     # ====================== 6. INTERACTION FEATURES WITH NEW FEATURES ======================
@@ -211,9 +256,9 @@ def engineer_advanced_features(df):
     
     # 6.2 List of new important composite features
     key_new_features = [
-        'lower_limit_attack_score',
-        'large_change_no_constraint_score',
-        'weighted_attack_score'
+        'min_boundary_approach_score',
+        'large_change_no_threshold_score',
+        'weighted_anomaly_score'
     ]
     
     # 6.3 Create interactions between key existing and new features
